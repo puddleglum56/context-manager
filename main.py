@@ -14,12 +14,18 @@ class ClaudeInterfaceApp(QMainWindow):
         self.resize(1000, 800)
         
         self.system_prompt = (
-            "Code changes should be formatted like:\n"
-            "<path>example/path.py</path><search>def example(args):</search><replace>def change(args):</replace>\n"
-            "File deletions like:\n"
-            "<delete>example/path.py</delete>\n"
+            "Code changes should be formatted like so:\n"
+            "Updated path: /home/example/path.py\n"
+            "Replace:\n"
+            "<original exact code block here>\n"
+            "With:\n"
+            "<new code block that replaces original>\n\n"
+            "File deletions should be formatted like:\n"
+            "Delete: /home/example/path.py\n\n"
             "New files like:\n"
-            "<new>example/path.py</new><content># set up new file</content>\n"
+            "New: /home/example/path.py\n"
+            "Content:\n"
+            "<new file code block here>\n\n"
             "Make sure all indentation and formatting is correct within old and new code blocks."
         )
 
@@ -79,7 +85,6 @@ class ClaudeInterfaceApp(QMainWindow):
         if dir_path:
             root_item = QTreeWidgetItem(self.tree)
             root_item.setText(0, dir_path)
-            # Changed ItemIsTristate to ItemIsAutoTristate
             root_item.setFlags(root_item.flags() | Qt.ItemFlag.ItemIsAutoTristate | Qt.ItemFlag.ItemIsUserCheckable)
             root_item.setCheckState(0, Qt.CheckState.Unchecked)
             root_item.setData(0, Qt.ItemDataRole.UserRole, dir_path)
@@ -95,7 +100,6 @@ class ClaudeInterfaceApp(QMainWindow):
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 
                 if entry.is_dir():
-                    # Changed ItemIsTristate to ItemIsAutoTristate
                     item.setFlags(item.flags() | Qt.ItemFlag.ItemIsAutoTristate)
                     item.setCheckState(0, Qt.CheckState.Unchecked)
                     item.setData(0, Qt.ItemDataRole.UserRole, entry.path)
@@ -142,9 +146,10 @@ class ClaudeInterfaceApp(QMainWindow):
             try:
                 with open(abs_path, 'r', encoding='utf-8') as f:
                     content = f.read()
-                output.append(f"File: {rel_path}\n```\n{content}\n```\n")
+                # Changed from rel_path to abs_path
+                output.append(f"File: {abs_path}\n```\n{content}\n```\n")
             except Exception as e:
-                output.append(f"File: {rel_path} (Error reading file: {e})\n")
+                output.append(f"File: {abs_path} (Error reading file: {e})\n")
 
         full_text = "\n".join(output)
         QApplication.clipboard().setText(full_text)
@@ -162,49 +167,85 @@ class ClaudeInterfaceApp(QMainWindow):
 
         changes_log = []
         
-        new_file_pattern = re.compile(r'<new>(.*?)</new>\s*<content>(.*?)</content>', re.DOTALL)
+        mod_pattern = re.compile(
+            r'Updated path:\s*(?P<path>[^\n]+)\s*\n'
+            r'Replace:\s*\n```(?:\w+)?\n(?P<search>.*?)```\s*\n'
+            r'With:\s*\n```(?:\w+)?\n(?P<replace>.*?)```',
+            re.DOTALL
+        )
+
+        new_file_pattern = re.compile(
+            r'New:\s*(?P<path>[^\n]+)\s*\n'
+            r'Content:\s*\n```(?:\w+)?\n(?P<content>.*?)```',
+            re.DOTALL
+        )
+
+        del_pattern = re.compile(r'Delete:\s*(?P<path>[^\n]+)', re.MULTILINE)
+
+        # 1. Handle New Files
         for match in new_file_pattern.finditer(response):
-            path = match.group(1).strip()
-            content = match.group(2)
+            path = match.group('path').strip()
+            content = match.group('content')
             if self.create_file(path, content):
                 changes_log.append(f"Created: {path}")
             else:
                 changes_log.append(f"Failed to create: {path}")
 
-        del_pattern = re.compile(r'<delete>(.*?)</delete>', re.DOTALL)
+        # 2. Handle Deletions
         for match in del_pattern.finditer(response):
-            path = match.group(1).strip()
+            path = match.group('path').strip()
             if self.delete_file(path):
                 changes_log.append(f"Deleted: {path}")
             else:
                 changes_log.append(f"Failed to delete: {path}")
 
-        mod_pattern = re.compile(r'<path>(.*?)</path>\s*<search>(.*?)</search>\s*<replace>(.*?)</replace>', re.DOTALL)
+        # 3. Handle Modifications
         for match in mod_pattern.finditer(response):
-            path = match.group(1).strip()
-            search_block = match.group(2)
-            replace_block = match.group(3)
+            path = match.group('path').strip()
+            search_block = match.group('search')
+            replace_block = match.group('replace')
+            
             if self.modify_file(path, search_block, replace_block):
                 changes_log.append(f"Modified: {path}")
             else:
                 changes_log.append(f"Failed to modify: {path}")
 
-        QMessageBox.information(self, "Result", "\n".join(changes_log) if changes_log else "No valid tags found.")
+        if not changes_log:
+            QMessageBox.information(self, "Result", "No valid patterns found in clipboard content.")
+        else:
+            QMessageBox.information(self, "Result", "\n".join(changes_log))
 
-    def resolve_abs_path(self, rel_path):
-        root_count = self.tree.topLevelItemCount()
+    def resolve_abs_path(self, path):
+        # Normalize
+        path = path.strip().replace('\\', '/')
         
+        # 1. Check if it's already an absolute path that exists
+        if os.path.isabs(path) and os.path.exists(path):
+            return path
+            
+        # 2. Check if it matches relative to any root
+        root_count = self.tree.topLevelItemCount()
         for i in range(root_count):
             root_item = self.tree.topLevelItem(i)
             root_path = root_item.data(0, Qt.ItemDataRole.UserRole)
-            potential_path = os.path.join(root_path, rel_path)
             
+            potential_path = os.path.join(root_path, path)
             if os.path.exists(potential_path):
                 return potential_path
-        
+            
+            # 3. If the input was absolute but didn't exist (maybe new file), 
+            # check if it starts with this root path
+            if path.startswith(root_path):
+                return path
+
+        # 4. Fallback for creation of NEW files
         if root_count > 0:
+            # If it's absolute, trust it
+            if os.path.isabs(path):
+                return path
+            # Otherwise default to first root
             first_root = self.tree.topLevelItem(0).data(0, Qt.ItemDataRole.UserRole)
-            return os.path.join(first_root, rel_path)
+            return os.path.join(first_root, path)
         
         return None
 
@@ -249,12 +290,20 @@ class ClaudeInterfaceApp(QMainWindow):
             else:
                 norm_content = content.replace('\r\n', '\n')
                 norm_search = search_txt.replace('\r\n', '\n')
+                norm_search_stripped = norm_search.strip()
+                
                 if norm_search in norm_content:
                     new_content = norm_content.replace(norm_search, replace_txt)
                     with open(abs_path, 'w', encoding='utf-8') as f:
                         f.write(new_content)
                     return True
                 
+                if norm_search_stripped in norm_content:
+                     new_content = norm_content.replace(norm_search_stripped, replace_txt)
+                     with open(abs_path, 'w', encoding='utf-8') as f:
+                        f.write(new_content)
+                     return True
+
                 print(f"Search block not found in {rel_path}")
                 return False
         except Exception as e:
