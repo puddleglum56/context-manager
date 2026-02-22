@@ -2,12 +2,14 @@ import sys
 import os
 import re
 import json
+import fnmatch
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QTextEdit, QFileDialog, 
                              QTreeWidget, QTreeWidgetItem, QMessageBox, QLabel, 
                              QSplitter, QTreeWidgetItemIterator, QComboBox, 
-                             QInputDialog, QFileIconProvider, QStyleFactory, QStyle)
-from PyQt6.QtCore import Qt, QFileInfo, QSize
+                             QInputDialog, QFileIconProvider, QStyleFactory, 
+                             QStyle, QCheckBox)
+from PyQt6.QtCore import Qt, QFileInfo, QSize, QTimer
 from PyQt6.QtGui import QIcon, QAction
 
 CONFIG_FILE = "projects.json"
@@ -16,20 +18,26 @@ class ClaudeInterfaceApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Claude Linux Interface")
-        self.resize(1100, 850)
+        self.resize(1200, 850)
         
         self.projects_data = {}
         self.current_project_name = "Default"
-        self.is_dark_mode = True
+        self.is_dark_mode = False
         self.icon_provider = QFileIconProvider()
+        self.file_trees = [] # Keep track of tree widgets
         
+        # Auto-refresh timer
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.timeout.connect(self.refresh_file_trees)
+        self.refresh_timer.start(10000) # 10 seconds
+
         self.system_prompt = (
             "Code changes should be formatted like so:\n"
             "Updated path: /home/example/path.py\n"
             "Replace:\n"
             "<original exact code block here>\n"
             "With:\n"
-            "<new code block that replaces original>\n\n"
+            "<new code block that replaces original>\n"
             "File deletions should be formatted like:\n"
             "Delete: /home/example/path.py\n\n"
             "New files like:\n"
@@ -89,17 +97,18 @@ class ClaudeInterfaceApp(QMainWindow):
         
         file_btn_layout = QHBoxLayout()
         self.btn_add_dir = QPushButton("Add Directory")
-        # Fixed: Usage of QStyle.StandardPixmap
         self.btn_add_dir.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon))
         self.btn_add_dir.clicked.connect(self.add_directory)
         file_btn_layout.addWidget(self.btn_add_dir)
+        
+        # Manual refresh button removed in favor of QTimer
+
         file_btn_layout.addStretch()
         files_layout.addLayout(file_btn_layout)
 
-        self.tree = QTreeWidget()
-        self.tree.setHeaderLabel("Project Files")
-        self.tree.itemChanged.connect(self.handle_item_changed)
-        files_layout.addWidget(self.tree)
+        # Splitter for multiple directory columns (Horizontal)
+        self.file_splitter = QSplitter(Qt.Orientation.Horizontal)
+        files_layout.addWidget(self.file_splitter)
         
         splitter.addWidget(files_widget)
 
@@ -112,20 +121,25 @@ class ClaudeInterfaceApp(QMainWindow):
         self.text_context = QTextEdit()
         context_layout.addWidget(self.text_context)
 
+        # Options for copy
+        options_layout = QHBoxLayout()
+        self.chk_include_sys = QCheckBox("Include System Prompt in Copy")
+        options_layout.addWidget(self.chk_include_sys)
+        options_layout.addStretch()
+        context_layout.addLayout(options_layout)
+
         action_layout = QHBoxLayout()
         
         self.btn_copy_context = QPushButton("Copy Context & Files")
-        # Fixed: Usage of QStyle.StandardPixmap
         self.btn_copy_context.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon))
         self.btn_copy_context.clicked.connect(self.copy_context_to_clipboard)
         action_layout.addWidget(self.btn_copy_context)
 
-        self.btn_copy_sys = QPushButton("Copy System Prompt")
+        self.btn_copy_sys = QPushButton("Copy System Prompt Only")
         self.btn_copy_sys.clicked.connect(self.copy_system_prompt)
         action_layout.addWidget(self.btn_copy_sys)
 
         self.btn_paste_apply = QPushButton("Paste Response & Apply")
-        # Fixed: Usage of QStyle.StandardPixmap
         self.btn_paste_apply.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton))
         self.btn_paste_apply.clicked.connect(self.paste_and_apply)
         action_layout.addWidget(self.btn_paste_apply)
@@ -156,6 +170,7 @@ class ClaudeInterfaceApp(QMainWindow):
                 QComboBox::drop-down { border: none; }
                 QSplitter::handle { background-color: #444; }
                 QHeaderView::section { background-color: #333; border: 1px solid #444; padding: 4px; color: #e0e0e0; }
+                QCheckBox { color: #e0e0e0; }
             """)
         else:
             self.setStyleSheet("""
@@ -210,9 +225,7 @@ class ClaudeInterfaceApp(QMainWindow):
                 QMessageBox.warning(self, "Error", "Project already exists.")
                 return
             
-            # Save current before switching
             self.save_current_project_state()
-            
             self.projects_data[name] = {"roots": [], "context": "", "checked": []}
             self.current_project_name = name
             self.update_project_combo()
@@ -244,21 +257,22 @@ class ClaudeInterfaceApp(QMainWindow):
         self.save_projects_to_disk()
 
     def save_current_project_state(self):
-        # Gather roots
         roots = []
-        for i in range(self.tree.topLevelItemCount()):
-            item = self.tree.topLevelItem(i)
-            roots.append(item.data(0, Qt.ItemDataRole.UserRole))
-            
-        # Gather checked files (absolute paths)
         checked = []
-        iterator = QTreeWidgetItemIterator(self.tree, QTreeWidgetItemIterator.IteratorFlag.Checked)
-        while iterator.value():
-            item = iterator.value()
-            path = item.data(0, Qt.ItemDataRole.UserRole)
-            if path and os.path.isfile(path):
-                checked.append(path)
-            iterator += 1
+        
+        for tree in self.file_trees:
+            if tree.topLevelItemCount() > 0:
+                root_item = tree.topLevelItem(0)
+                root_path = root_item.data(0, Qt.ItemDataRole.UserRole)
+                roots.append(root_path)
+
+            iterator = QTreeWidgetItemIterator(tree, QTreeWidgetItemIterator.IteratorFlag.Checked)
+            while iterator.value():
+                item = iterator.value()
+                path = item.data(0, Qt.ItemDataRole.UserRole)
+                if path and os.path.isfile(path):
+                    checked.append(path)
+                iterator += 1
             
         self.projects_data[self.current_project_name] = {
             "roots": roots,
@@ -270,7 +284,11 @@ class ClaudeInterfaceApp(QMainWindow):
 
     def load_project_state(self, name):
         data = self.projects_data.get(name, {})
-        self.tree.clear()
+        
+        for tree in self.file_trees:
+            tree.deleteLater()
+        self.file_trees = []
+        
         self.text_context.setPlainText(data.get("context", ""))
         
         roots = data.get("roots", [])
@@ -278,38 +296,132 @@ class ClaudeInterfaceApp(QMainWindow):
         
         for root_path in roots:
             if os.path.exists(root_path):
-                self.add_directory_to_tree(root_path, checked_set)
+                self.add_directory_column(root_path, checked_set)
                 
     # --- File Logic ---
     def add_directory(self):
         dir_path = QFileDialog.getExistingDirectory(self, "Select Directory")
         if dir_path:
-            # Check if already added
-            for i in range(self.tree.topLevelItemCount()):
-                if self.tree.topLevelItem(i).data(0, Qt.ItemDataRole.UserRole) == dir_path:
-                    return
+            for tree in self.file_trees:
+                if tree.topLevelItemCount() > 0:
+                    existing_root = tree.topLevelItem(0).data(0, Qt.ItemDataRole.UserRole)
+                    if existing_root == dir_path:
+                        return
 
-            self.add_directory_to_tree(dir_path)
-            self.save_current_project_state() # Auto-save on structure change
+            self.add_directory_column(dir_path)
+            self.save_current_project_state()
 
-    def add_directory_to_tree(self, dir_path, checked_set=None):
-        root_item = QTreeWidgetItem(self.tree)
+    def add_directory_column(self, dir_path, checked_set=None):
+        if len(self.file_trees) >= 5:
+            QMessageBox.warning(self, "Limit Reached", "Maximum of 5 directory columns allowed.")
+            return
+
+        tree = QTreeWidget()
+        tree.setHeaderLabel(os.path.basename(dir_path))
+        tree.itemChanged.connect(self.handle_item_changed)
+        
+        root_item = QTreeWidgetItem(tree)
         root_item.setText(0, dir_path)
         root_item.setIcon(0, self.icon_provider.icon(QFileInfo(dir_path)))
         root_item.setFlags(root_item.flags() | Qt.ItemFlag.ItemIsAutoTristate | Qt.ItemFlag.ItemIsUserCheckable)
         root_item.setCheckState(0, Qt.CheckState.Unchecked)
         root_item.setData(0, Qt.ItemDataRole.UserRole, dir_path)
         
-        self.populate_tree(dir_path, root_item, checked_set)
+        # Load .gitignore patterns for this root
+        ignore_patterns = self.load_gitignore(dir_path)
+        
+        self.populate_tree(dir_path, root_item, checked_set, ignore_patterns)
         root_item.setExpanded(True)
+        
+        self.file_splitter.addWidget(tree)
+        self.file_trees.append(tree)
 
-    def populate_tree(self, path, parent_item, checked_set=None):
+    def load_gitignore(self, root_path):
+        patterns = ['.git', '__pycache__', '.DS_Store', '*.pyc'] # Defaults
+        git_path = os.path.join(root_path, '.gitignore')
+        if os.path.exists(git_path):
+            try:
+                with open(git_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith('#'):
+                            patterns.append(line)
+            except Exception:
+                pass
+        return patterns
+
+    def is_ignored(self, name, patterns):
+        for pattern in patterns:
+            # Handle directory markers roughly
+            clean_pattern = pattern.rstrip('/')
+            if fnmatch.fnmatch(name, clean_pattern):
+                return True
+        return False
+
+    def refresh_file_trees(self):
+        # 1. Capture State (Checked Files AND Expanded Paths)
+        checked_files = [f[0] for f in self.get_checked_files()]
+        checked_set = set(checked_files)
+        
+        expanded_paths = set()
+        for tree in self.file_trees:
+            iterator = QTreeWidgetItemIterator(tree)
+            while iterator.value():
+                item = iterator.value()
+                if item.isExpanded():
+                    path = item.data(0, Qt.ItemDataRole.UserRole)
+                    if path:
+                        expanded_paths.add(path)
+                iterator += 1
+        
+        # 2. Rebuild Trees
+        for tree in self.file_trees:
+            if tree.topLevelItemCount() == 0: continue
+            
+            root_item = tree.topLevelItem(0)
+            root_path = root_item.data(0, Qt.ItemDataRole.UserRole)
+            
+            # Temporary block signals to prevent event spam during reload
+            tree.blockSignals(True)
+            tree.clear()
+            
+            if os.path.exists(root_path):
+                new_root = QTreeWidgetItem(tree)
+                new_root.setText(0, root_path)
+                new_root.setIcon(0, self.icon_provider.icon(QFileInfo(root_path)))
+                new_root.setFlags(new_root.flags() | Qt.ItemFlag.ItemIsAutoTristate | Qt.ItemFlag.ItemIsUserCheckable)
+                new_root.setCheckState(0, Qt.CheckState.Unchecked)
+                new_root.setData(0, Qt.ItemDataRole.UserRole, root_path)
+                
+                ignore_patterns = self.load_gitignore(root_path)
+                self.populate_tree(root_path, new_root, checked_set, ignore_patterns)
+                
+                # 3. Restore Expansion
+                if root_path in expanded_paths:
+                    new_root.setExpanded(True)
+                
+                # Restore expansion for children
+                iterator = QTreeWidgetItemIterator(tree)
+                while iterator.value():
+                    item = iterator.value()
+                    path = item.data(0, Qt.ItemDataRole.UserRole)
+                    if path in expanded_paths:
+                        item.setExpanded(True)
+                    iterator += 1
+            
+            tree.blockSignals(False)
+
+    def populate_tree(self, path, parent_item, checked_set=None, ignore_patterns=None):
+        if ignore_patterns is None: ignore_patterns = []
         try:
             for entry in sorted(os.scandir(path), key=lambda e: (not e.is_dir(), e.name.lower())):
+                # Check ignore
+                if self.is_ignored(entry.name, ignore_patterns):
+                    continue
+
                 item = QTreeWidgetItem(parent_item)
                 item.setText(0, entry.name)
                 
-                # Icon logic
                 file_info = QFileInfo(entry.path)
                 icon = self.icon_provider.icon(file_info)
                 item.setIcon(0, icon)
@@ -320,7 +432,7 @@ class ClaudeInterfaceApp(QMainWindow):
                 if entry.is_dir():
                     item.setFlags(item.flags() | Qt.ItemFlag.ItemIsAutoTristate)
                     item.setCheckState(0, Qt.CheckState.Unchecked)
-                    self.populate_tree(entry.path, item, checked_set)
+                    self.populate_tree(entry.path, item, checked_set, ignore_patterns)
                 else:
                     is_checked = checked_set and entry.path in checked_set
                     item.setCheckState(0, Qt.CheckState.Checked if is_checked else Qt.CheckState.Unchecked)
@@ -333,16 +445,17 @@ class ClaudeInterfaceApp(QMainWindow):
 
     def get_checked_files(self):
         checked_files = []
-        iterator = QTreeWidgetItemIterator(self.tree, QTreeWidgetItemIterator.IteratorFlag.Checked)
-        while iterator.value():
-            item = iterator.value()
-            path = item.data(0, Qt.ItemDataRole.UserRole)
-            if path and os.path.isfile(path):
-                root_path = self.get_root_path(item)
-                if root_path:
-                    rel_path = os.path.relpath(path, root_path)
-                    checked_files.append((path, rel_path))
-            iterator += 1
+        for tree in self.file_trees:
+            iterator = QTreeWidgetItemIterator(tree, QTreeWidgetItemIterator.IteratorFlag.Checked)
+            while iterator.value():
+                item = iterator.value()
+                path = item.data(0, Qt.ItemDataRole.UserRole)
+                if path and os.path.isfile(path):
+                    root_path = self.get_root_path(item)
+                    if root_path:
+                        rel_path = os.path.relpath(path, root_path)
+                        checked_files.append((path, rel_path))
+                iterator += 1
         return checked_files
 
     def get_root_path(self, item):
@@ -355,10 +468,6 @@ class ClaudeInterfaceApp(QMainWindow):
         files = self.get_checked_files()
         output = []
         
-        user_context = self.text_context.toPlainText().strip()
-        if user_context:
-            output.append(f"Context:\n{user_context}\n")
-
         output.append("Files:")
         for abs_path, rel_path in files:
             try:
@@ -367,6 +476,15 @@ class ClaudeInterfaceApp(QMainWindow):
                 output.append(f"File: {abs_path}\n```\n{content}\n```\n")
             except Exception as e:
                 output.append(f"File: {abs_path} (Error reading file: {e})\n")
+        
+        if self.chk_include_sys.isChecked():
+            output.append("\n=== System Prompt ===")
+            output.append(self.system_prompt)
+            output.append("=====================\n")
+
+        user_context = self.text_context.toPlainText().strip()
+        if user_context:
+            output.append(f"\nContext/Instructions:\n{user_context}\n")
 
         full_text = "\n".join(output)
         QApplication.clipboard().setText(full_text)
@@ -384,63 +502,76 @@ class ClaudeInterfaceApp(QMainWindow):
 
         changes_log = []
         
-        mod_pattern = re.compile(
-            r'Updated path:\s*(?P<path>[^\n]+)\s*\n'
-            r'Replace:\s*\n```(?:\w+)?\n(?P<search>.*?)```\s*\n'
-            r'With:\s*\n```(?:\w+)?\n(?P<replace>.*?)```',
-            re.DOTALL
-        )
+        # Regex to identify headers: Updated path, New, or Delete
+        # We capture the type (e.g. "Updated path:") and the rest of the line (the path)
+        header_pattern = re.compile(r'^(?P<type>Updated path:|New:|Delete:)\s*(?P<path>[^\n]+)', re.MULTILINE)
+        
+        matches = list(header_pattern.finditer(response))
+        if not matches:
+            QMessageBox.information(self, "Result", "No valid patterns found in clipboard content.")
+            return
 
-        new_file_pattern = re.compile(
-            r'New:\s*(?P<path>[^\n]+)\s*\n'
-            r'Content:\s*\n```(?:\w+)?\n(?P<content>.*?)```',
-            re.DOTALL
-        )
-
-        del_pattern = re.compile(r'Delete:\s*(?P<path>[^\n]+)', re.MULTILINE)
-
-        # 1. Handle New Files
-        for match in new_file_pattern.finditer(response):
-            path = match.group('path').strip()
-            content = match.group('content')
-            if self.create_file(path, content):
-                changes_log.append(f"Created: {path}")
-            else:
-                changes_log.append(f"Failed to create: {path}")
-
-        # 2. Handle Deletions
-        for match in del_pattern.finditer(response):
-            path = match.group('path').strip()
-            if self.delete_file(path):
-                changes_log.append(f"Deleted: {path}")
-            else:
-                changes_log.append(f"Failed to delete: {path}")
-
-        # 3. Handle Modifications
-        for match in mod_pattern.finditer(response):
-            path = match.group('path').strip()
-            search_block = match.group('search')
-            replace_block = match.group('replace')
+        for i, match in enumerate(matches):
+            header_type = match.group('type')
+            path_str = match.group('path').strip()
             
-            if self.modify_file(path, search_block, replace_block):
-                changes_log.append(f"Modified: {path}")
-            else:
-                changes_log.append(f"Failed to modify: {path}")
+            # Get the block of text belonging to this segment
+            start_index = match.start()
+            end_index = matches[i+1].start() if i + 1 < len(matches) else len(response)
+            segment = response[start_index:end_index]
+            
+            if header_type == "Updated path:":
+                # This is the only place where multiple "Replace...With" are allowed
+                mod_pattern = re.compile(
+                    r'Replace:\s*\n```(?:\w+)?\n(?P<search>.*?)```\s*\n'
+                    r'With:\s*\n```(?:\w+)?\n(?P<replace>.*?)```',
+                    re.DOTALL
+                )
+                
+                replacements = list(mod_pattern.finditer(segment))
+                if replacements:
+                    for rep_match in replacements:
+                        search_block = rep_match.group('search')
+                        replace_block = rep_match.group('replace')
+                        if self.modify_file(path_str, search_block, replace_block):
+                             changes_log.append(f"Modified: {path_str}")
+                        else:
+                             changes_log.append(f"Failed to modify: {path_str}")
+                else:
+                    changes_log.append(f"No Replace/With blocks found for: {path_str}")
+
+            elif header_type == "New:":
+                content_pattern = re.compile(r'Content:\s*\n```(?:\w+)?\n(?P<content>.*?)```', re.DOTALL)
+                c_match = content_pattern.search(segment)
+                if c_match:
+                    content = c_match.group('content')
+                    if self.create_file(path_str, content):
+                        changes_log.append(f"Created: {path_str}")
+                    else:
+                        changes_log.append(f"Failed to create: {path_str}")
+                else:
+                    changes_log.append(f"No content found for new file: {path_str}")
+
+            elif header_type == "Delete:":
+                if self.delete_file(path_str):
+                    changes_log.append(f"Deleted: {path_str}")
+                else:
+                    changes_log.append(f"Failed to delete: {path_str}")
 
         if not changes_log:
-            QMessageBox.information(self, "Result", "No valid patterns found in clipboard content.")
+            QMessageBox.information(self, "Result", "No changes applied.")
         else:
             QMessageBox.information(self, "Result", "\n".join(changes_log))
+            self.refresh_file_trees() # Auto-refresh immediately after changes
 
     def resolve_abs_path(self, path):
         path = path.strip().replace('\\', '/')
         if os.path.isabs(path) and os.path.exists(path):
             return path
             
-        root_count = self.tree.topLevelItemCount()
-        for i in range(root_count):
-            root_item = self.tree.topLevelItem(i)
-            root_path = root_item.data(0, Qt.ItemDataRole.UserRole)
+        for tree in self.file_trees:
+            if tree.topLevelItemCount() == 0: continue
+            root_path = tree.topLevelItem(0).data(0, Qt.ItemDataRole.UserRole)
             
             potential_path = os.path.join(root_path, path)
             if os.path.exists(potential_path):
@@ -449,13 +580,11 @@ class ClaudeInterfaceApp(QMainWindow):
             if path.startswith(root_path):
                 return path
 
-        if root_count > 0:
-            if os.path.isabs(path):
-                return path
-            first_root = self.tree.topLevelItem(0).data(0, Qt.ItemDataRole.UserRole)
+        if self.file_trees and not os.path.isabs(path):
+            first_root = self.file_trees[0].topLevelItem(0).data(0, Qt.ItemDataRole.UserRole)
             return os.path.join(first_root, path)
         
-        return None
+        return path if os.path.isabs(path) else None
 
     def create_file(self, rel_path, content):
         abs_path = self.resolve_abs_path(rel_path)
@@ -525,7 +654,7 @@ class ClaudeInterfaceApp(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setStyle(QStyleFactory.create("Fusion")) # Better base for styling
+    app.setStyle(QStyleFactory.create("Fusion"))
     window = ClaudeInterfaceApp()
     window.show()
     sys.exit(app.exec())
