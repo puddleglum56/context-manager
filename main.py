@@ -24,12 +24,16 @@ class ClaudeInterfaceApp(QMainWindow):
         self.current_project_name = "Default"
         self.is_dark_mode = False
         self.icon_provider = QFileIconProvider()
-        self.file_trees = [] # Keep track of tree widgets
+        self.file_trees = []
+        self.is_dirty = False
         
-        # Auto-refresh timer
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.refresh_file_trees)
-        self.refresh_timer.start(10000) # 10 seconds
+        self.refresh_timer.start(10000)
+
+        self.autosave_timer = QTimer(self)
+        self.autosave_timer.timeout.connect(self.auto_save)
+        self.autosave_timer.start(3000)
 
         self.system_prompt = (
             "Code changes should be formatted like so:\n"
@@ -58,7 +62,6 @@ class ClaudeInterfaceApp(QMainWindow):
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(10)
 
-        # --- Top Bar: Project Management & Theme ---
         top_bar = QHBoxLayout()
         
         self.project_combo = QComboBox()
@@ -90,7 +93,6 @@ class ClaudeInterfaceApp(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Vertical)
         main_layout.addWidget(splitter)
 
-        # --- File Section ---
         files_widget = QWidget()
         files_layout = QVBoxLayout(files_widget)
         files_layout.setContentsMargins(0, 0, 0, 0)
@@ -101,27 +103,23 @@ class ClaudeInterfaceApp(QMainWindow):
         self.btn_add_dir.clicked.connect(self.add_directory)
         file_btn_layout.addWidget(self.btn_add_dir)
         
-        # Manual refresh button removed in favor of QTimer
-
         file_btn_layout.addStretch()
         files_layout.addLayout(file_btn_layout)
 
-        # Splitter for multiple directory columns (Horizontal)
         self.file_splitter = QSplitter(Qt.Orientation.Horizontal)
         files_layout.addWidget(self.file_splitter)
         
         splitter.addWidget(files_widget)
 
-        # --- Context Section ---
         context_widget = QWidget()
         context_layout = QVBoxLayout(context_widget)
         context_layout.setContentsMargins(0, 10, 0, 0)
         
         context_layout.addWidget(QLabel("Additional Context / Prompt:"))
         self.text_context = QTextEdit()
+        self.text_context.textChanged.connect(self.mark_dirty)
         context_layout.addWidget(self.text_context)
 
-        # Options for copy
         options_layout = QHBoxLayout()
         self.chk_include_sys = QCheckBox("Include System Prompt in Copy")
         options_layout.addWidget(self.chk_include_sys)
@@ -150,7 +148,6 @@ class ClaudeInterfaceApp(QMainWindow):
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 1)
 
-    # --- Theme & Styling ---
     def toggle_theme(self):
         self.is_dark_mode = not self.is_dark_mode
         self.apply_theme()
@@ -182,7 +179,13 @@ class ClaudeInterfaceApp(QMainWindow):
                 QComboBox { background-color: white; border: 1px solid #ccc; padding: 5px; }
             """)
 
-    # --- Project Management ---
+    def mark_dirty(self, *args):
+        self.is_dirty = True
+
+    def auto_save(self):
+        if self.is_dirty:
+            self.save_current_project_state()
+
     def load_projects(self):
         if os.path.exists(CONFIG_FILE):
             try:
@@ -238,7 +241,7 @@ class ClaudeInterfaceApp(QMainWindow):
             return
             
         confirm = QMessageBox.question(self, "Confirm", f"Delete project '{self.current_project_name}'?", 
-                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if confirm == QMessageBox.StandardButton.Yes:
             del self.projects_data[self.current_project_name]
             self.current_project_name = list(self.projects_data.keys())[0]
@@ -280,6 +283,7 @@ class ClaudeInterfaceApp(QMainWindow):
             "checked": checked
         }
         self.save_projects_to_disk()
+        self.is_dirty = False
         self.status_message("Project saved.")
 
     def load_project_state(self, name):
@@ -289,7 +293,9 @@ class ClaudeInterfaceApp(QMainWindow):
             tree.deleteLater()
         self.file_trees = []
         
+        self.text_context.blockSignals(True)
         self.text_context.setPlainText(data.get("context", ""))
+        self.text_context.blockSignals(False)
         
         roots = data.get("roots", [])
         checked_set = set(data.get("checked", []))
@@ -298,7 +304,8 @@ class ClaudeInterfaceApp(QMainWindow):
             if os.path.exists(root_path):
                 self.add_directory_column(root_path, checked_set)
                 
-    # --- File Logic ---
+        self.is_dirty = False
+
     def add_directory(self):
         dir_path = QFileDialog.getExistingDirectory(self, "Select Directory")
         if dir_path:
@@ -318,7 +325,9 @@ class ClaudeInterfaceApp(QMainWindow):
 
         tree = QTreeWidget()
         tree.setHeaderLabel(os.path.basename(dir_path))
-        tree.itemChanged.connect(self.handle_item_changed)
+        tree.itemChanged.connect(self.mark_dirty)
+        tree.itemExpanded.connect(self.mark_dirty)
+        tree.itemCollapsed.connect(self.mark_dirty)
         
         root_item = QTreeWidgetItem(tree)
         root_item.setText(0, dir_path)
@@ -327,17 +336,18 @@ class ClaudeInterfaceApp(QMainWindow):
         root_item.setCheckState(0, Qt.CheckState.Unchecked)
         root_item.setData(0, Qt.ItemDataRole.UserRole, dir_path)
         
-        # Load .gitignore patterns for this root
         ignore_patterns = self.load_gitignore(dir_path)
         
+        tree.blockSignals(True)
         self.populate_tree(dir_path, root_item, checked_set, ignore_patterns)
         root_item.setExpanded(True)
+        tree.blockSignals(False)
         
         self.file_splitter.addWidget(tree)
         self.file_trees.append(tree)
 
     def load_gitignore(self, root_path):
-        patterns = ['.git', '__pycache__', '.DS_Store', '*.pyc'] # Defaults
+        patterns = ['.git', '__pycache__', '.DS_Store', '*.pyc']
         git_path = os.path.join(root_path, '.gitignore')
         if os.path.exists(git_path):
             try:
@@ -352,14 +362,12 @@ class ClaudeInterfaceApp(QMainWindow):
 
     def is_ignored(self, name, patterns):
         for pattern in patterns:
-            # Handle directory markers roughly
             clean_pattern = pattern.rstrip('/')
             if fnmatch.fnmatch(name, clean_pattern):
                 return True
         return False
 
     def refresh_file_trees(self):
-        # 1. Capture State (Checked Files AND Expanded Paths)
         checked_files = [f[0] for f in self.get_checked_files()]
         checked_set = set(checked_files)
         
@@ -374,14 +382,12 @@ class ClaudeInterfaceApp(QMainWindow):
                         expanded_paths.add(path)
                 iterator += 1
         
-        # 2. Rebuild Trees
         for tree in self.file_trees:
             if tree.topLevelItemCount() == 0: continue
             
             root_item = tree.topLevelItem(0)
             root_path = root_item.data(0, Qt.ItemDataRole.UserRole)
             
-            # Temporary block signals to prevent event spam during reload
             tree.blockSignals(True)
             tree.clear()
             
@@ -396,11 +402,9 @@ class ClaudeInterfaceApp(QMainWindow):
                 ignore_patterns = self.load_gitignore(root_path)
                 self.populate_tree(root_path, new_root, checked_set, ignore_patterns)
                 
-                # 3. Restore Expansion
                 if root_path in expanded_paths:
                     new_root.setExpanded(True)
                 
-                # Restore expansion for children
                 iterator = QTreeWidgetItemIterator(tree)
                 while iterator.value():
                     item = iterator.value()
@@ -415,7 +419,6 @@ class ClaudeInterfaceApp(QMainWindow):
         if ignore_patterns is None: ignore_patterns = []
         try:
             for entry in sorted(os.scandir(path), key=lambda e: (not e.is_dir(), e.name.lower())):
-                # Check ignore
                 if self.is_ignored(entry.name, ignore_patterns):
                     continue
 
@@ -439,9 +442,6 @@ class ClaudeInterfaceApp(QMainWindow):
                     
         except PermissionError:
             pass
-
-    def handle_item_changed(self, item, column):
-        pass
 
     def get_checked_files(self):
         checked_files = []
@@ -502,8 +502,6 @@ class ClaudeInterfaceApp(QMainWindow):
 
         changes_log = []
         
-        # Regex to identify headers: Updated path, New, or Delete
-        # We capture the type (e.g. "Updated path:") and the rest of the line (the path)
         header_pattern = re.compile(r'^(?P<type>Updated path:|New:|Delete:)\s*(?P<path>[^\n]+)', re.MULTILINE)
         
         matches = list(header_pattern.finditer(response))
@@ -515,13 +513,11 @@ class ClaudeInterfaceApp(QMainWindow):
             header_type = match.group('type')
             path_str = match.group('path').strip()
             
-            # Get the block of text belonging to this segment
             start_index = match.start()
             end_index = matches[i+1].start() if i + 1 < len(matches) else len(response)
             segment = response[start_index:end_index]
             
             if header_type == "Updated path:":
-                # This is the only place where multiple "Replace...With" are allowed
                 mod_pattern = re.compile(
                     r'Replace:\s*\n```(?:\w+)?\n(?P<search>.*?)```\s*\n'
                     r'With:\s*\n```(?:\w+)?\n(?P<replace>.*?)```',
@@ -562,7 +558,7 @@ class ClaudeInterfaceApp(QMainWindow):
             QMessageBox.information(self, "Result", "No changes applied.")
         else:
             QMessageBox.information(self, "Result", "\n".join(changes_log))
-            self.refresh_file_trees() # Auto-refresh immediately after changes
+            self.refresh_file_trees() 
 
     def resolve_abs_path(self, path):
         path = path.strip().replace('\\', '/')
