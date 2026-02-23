@@ -511,7 +511,7 @@ class ClaudeInterfaceApp(QMainWindow):
 
         for i, match in enumerate(matches):
             header_type = match.group('type')
-            path_str = match.group('path').strip()
+            path_str = match.group('path').strip().strip('`\'"')
             
             start_index = match.start()
             end_index = matches[i+1].start() if i + 1 < len(matches) else len(response)
