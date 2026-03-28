@@ -36,6 +36,10 @@ class ClaudeInterfaceApp(QMainWindow):
         self.autosave_timer.start(3000)
 
         self.system_prompt = (
+            "I prefer concise, short responses.\n"
+            "Do not use any emojis.\n"
+            "Only add comments to code when code functionality is not very clear on its own.\n"
+            "Adhere to patterns used in the input code. If you deviate from a pattern, explain why. Prefer clean, sustainable solutions to quick, dirty ones, even if the code is longer. Clarity is most important.\n"
             "Code changes should be formatted like so:\n"
             "Updated path: /home/example/path.py\n"
             "Replace:\n"
@@ -48,7 +52,11 @@ class ClaudeInterfaceApp(QMainWindow):
             "New: /home/example/path.py\n"
             "Content:\n"
             "<new file code block here>\n\n"
-            "Make sure all indentation and formatting is correct within old and new code blocks."
+            "Replace entire file content like:\n"
+            "Replace file: /home/example/path.py\n"
+            "Content:\n"
+            "<new file content here>\n"
+            "Make sure all indentation and formatting is correct within old and new code blocks and that you use formatting tags like ```typescript or ```python where appropriate."
         )
 
         self.setup_ui()
@@ -197,7 +205,7 @@ class ClaudeInterfaceApp(QMainWindow):
                 print(f"Error loading projects: {e}")
         
         if not self.projects_data:
-            self.projects_data = {"Default": {"roots": [], "context": "", "checked": []}}
+            self.projects_data = {"Default": {"roots": [], "context": "", "checked": [], "expanded": []}}
             self.current_project_name = "Default"
 
         self.update_project_combo()
@@ -229,7 +237,7 @@ class ClaudeInterfaceApp(QMainWindow):
                 return
             
             self.save_current_project_state()
-            self.projects_data[name] = {"roots": [], "context": "", "checked": []}
+            self.projects_data[name] = {"roots": [], "context": "", "checked": [], "expanded": []}
             self.current_project_name = name
             self.update_project_combo()
             self.load_project_state(name)
@@ -262,6 +270,7 @@ class ClaudeInterfaceApp(QMainWindow):
     def save_current_project_state(self):
         roots = []
         checked = []
+        expanded = []
         
         for tree in self.file_trees:
             if tree.topLevelItemCount() > 0:
@@ -269,18 +278,24 @@ class ClaudeInterfaceApp(QMainWindow):
                 root_path = root_item.data(0, Qt.ItemDataRole.UserRole)
                 roots.append(root_path)
 
-            iterator = QTreeWidgetItemIterator(tree, QTreeWidgetItemIterator.IteratorFlag.Checked)
+            iterator = QTreeWidgetItemIterator(tree)
             while iterator.value():
                 item = iterator.value()
                 path = item.data(0, Qt.ItemDataRole.UserRole)
-                if path and os.path.isfile(path):
+                
+                if path and item.checkState(0) == Qt.CheckState.Checked and os.path.isfile(path):
                     checked.append(path)
+                
+                if path and item.isExpanded():
+                    expanded.append(path)
+                    
                 iterator += 1
             
         self.projects_data[self.current_project_name] = {
             "roots": roots,
             "context": self.text_context.toPlainText(),
-            "checked": checked
+            "checked": checked,
+            "expanded": expanded
         }
         self.save_projects_to_disk()
         self.is_dirty = False
@@ -299,10 +314,11 @@ class ClaudeInterfaceApp(QMainWindow):
         
         roots = data.get("roots", [])
         checked_set = set(data.get("checked", []))
+        expanded_set = set(data.get("expanded", []))
         
         for root_path in roots:
             if os.path.exists(root_path):
-                self.add_directory_column(root_path, checked_set)
+                self.add_directory_column(root_path, checked_set, expanded_set)
                 
         self.is_dirty = False
 
@@ -318,7 +334,7 @@ class ClaudeInterfaceApp(QMainWindow):
             self.add_directory_column(dir_path)
             self.save_current_project_state()
 
-    def add_directory_column(self, dir_path, checked_set=None):
+    def add_directory_column(self, dir_path, checked_set=None, expanded_set=None):
         if len(self.file_trees) >= 5:
             QMessageBox.warning(self, "Limit Reached", "Maximum of 5 directory columns allowed.")
             return
@@ -339,8 +355,13 @@ class ClaudeInterfaceApp(QMainWindow):
         ignore_patterns = self.load_gitignore(dir_path)
         
         tree.blockSignals(True)
-        self.populate_tree(dir_path, root_item, checked_set, ignore_patterns)
-        root_item.setExpanded(True)
+        self.populate_tree(dir_path, root_item, checked_set, ignore_patterns, expanded_set)
+        
+        if expanded_set and dir_path in expanded_set:
+            root_item.setExpanded(True)
+        elif not expanded_set:
+            root_item.setExpanded(True)
+            
         tree.blockSignals(False)
         
         self.file_splitter.addWidget(tree)
@@ -400,22 +421,14 @@ class ClaudeInterfaceApp(QMainWindow):
                 new_root.setData(0, Qt.ItemDataRole.UserRole, root_path)
                 
                 ignore_patterns = self.load_gitignore(root_path)
-                self.populate_tree(root_path, new_root, checked_set, ignore_patterns)
+                self.populate_tree(root_path, new_root, checked_set, ignore_patterns, expanded_paths)
                 
                 if root_path in expanded_paths:
                     new_root.setExpanded(True)
-                
-                iterator = QTreeWidgetItemIterator(tree)
-                while iterator.value():
-                    item = iterator.value()
-                    path = item.data(0, Qt.ItemDataRole.UserRole)
-                    if path in expanded_paths:
-                        item.setExpanded(True)
-                    iterator += 1
             
             tree.blockSignals(False)
 
-    def populate_tree(self, path, parent_item, checked_set=None, ignore_patterns=None):
+    def populate_tree(self, path, parent_item, checked_set=None, ignore_patterns=None, expanded_set=None):
         if ignore_patterns is None: ignore_patterns = []
         try:
             for entry in sorted(os.scandir(path), key=lambda e: (not e.is_dir(), e.name.lower())):
@@ -435,7 +448,9 @@ class ClaudeInterfaceApp(QMainWindow):
                 if entry.is_dir():
                     item.setFlags(item.flags() | Qt.ItemFlag.ItemIsAutoTristate)
                     item.setCheckState(0, Qt.CheckState.Unchecked)
-                    self.populate_tree(entry.path, item, checked_set, ignore_patterns)
+                    self.populate_tree(entry.path, item, checked_set, ignore_patterns, expanded_set)
+                    if expanded_set and entry.path in expanded_set:
+                        item.setExpanded(True)
                 else:
                     is_checked = checked_set and entry.path in checked_set
                     item.setCheckState(0, Qt.CheckState.Checked if is_checked else Qt.CheckState.Unchecked)
