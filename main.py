@@ -40,7 +40,7 @@ class ClaudeInterfaceApp(QMainWindow):
             "Do not use any emojis.\n"
             "Only add comments to code when code functionality is not very clear on its own.\n"
             "Adhere to patterns used in the input code. If you deviate from a pattern, explain why. Prefer clean, sustainable solutions to quick, dirty ones, even if the code is longer. Clarity is most important.\n"
-            "Code changes should be formatted like so:\n"
+            "All code changes should be formatted like so:\n"
             "Updated path: /home/example/path.py\n"
             "Replace:\n"
             "<original exact code block here>\n"
@@ -48,7 +48,7 @@ class ClaudeInterfaceApp(QMainWindow):
             "<new code block that replaces original>\n"
             "File deletions should be formatted like:\n"
             "Delete: /home/example/path.py\n\n"
-            "New files like:\n"
+            "New files should be formatted like:\n"
             "New: /home/example/path.py\n"
             "Content:\n"
             "<new file code block here>\n\n"
@@ -56,6 +56,7 @@ class ClaudeInterfaceApp(QMainWindow):
             "Replace file: /home/example/path.py\n"
             "Content:\n"
             "<new file content here>\n"
+            "It is important to adhere to the above formats exactly so that the interface can correctly parse your response.\n"
             "Make sure all indentation and formatting is correct within old and new code blocks and that you use formatting tags like ```typescript or ```python where appropriate."
         )
 
@@ -517,7 +518,7 @@ class ClaudeInterfaceApp(QMainWindow):
 
         changes_log = []
         
-        header_pattern = re.compile(r'^(?P<type>Updated path:|New:|Delete:)\s*(?P<path>[^\n]+)', re.MULTILINE)
+        header_pattern = re.compile(r'^(?P<type>Updated path:|New:|Replace file:|Delete:)\s*(?P<path>[^\n]+)', re.MULTILINE)
         
         matches = list(header_pattern.finditer(response))
         if not matches:
@@ -535,6 +536,7 @@ class ClaudeInterfaceApp(QMainWindow):
             if header_type == "Updated path:":
                 mod_pattern = re.compile(
                     r'Replace:\s*\n```(?:\w+)?\n(?P<search>.*?)```\s*\n'
+                    r'.*?'
                     r'With:\s*\n```(?:\w+)?\n(?P<replace>.*?)```',
                     re.DOTALL
                 )
@@ -551,8 +553,8 @@ class ClaudeInterfaceApp(QMainWindow):
                 else:
                     changes_log.append(f"No Replace/With blocks found for: {path_str}")
 
-            elif header_type == "New:":
-                content_pattern = re.compile(r'Content:\s*\n```(?:\w+)?\n(?P<content>.*?)```', re.DOTALL)
+            elif header_type == "New:" or header_type == "Replace file:":
+                content_pattern = re.compile(r'Content:\s*\n.*?```(?:\w+)?\n(?P<content>.*?)```', re.DOTALL)
                 c_match = content_pattern.search(segment)
                 if c_match:
                     content = c_match.group('content')
