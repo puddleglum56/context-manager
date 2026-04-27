@@ -59,6 +59,11 @@ class ClaudeInterfaceApp(QMainWindow):
             "It is important to adhere to the above formats exactly so that the interface can correctly parse your response.\n"
             "Make sure all indentation and formatting is correct within old and new code blocks and that you use formatting tags like ```typescript or ```python where appropriate."
         )
+        
+        self.related_files_prompt = (
+            "Please, just give me a list of the files (full paths) that might be related to this issue. Format your answer like so:\n"
+            "Paths: /path/to/file.ts, /path/to/other_file.ts, /other_path/to/file2.ts"
+        )
 
         self.setup_ui()
         self.load_projects()
@@ -152,6 +157,22 @@ class ClaudeInterfaceApp(QMainWindow):
         action_layout.addWidget(self.btn_paste_apply)
 
         context_layout.addLayout(action_layout)
+        
+        # New row of buttons
+        related_files_layout = QHBoxLayout()
+        
+        self.btn_related_files = QPushButton("Copy for Related Files")
+        self.btn_related_files.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogContentsView))
+        self.btn_related_files.clicked.connect(self.copy_for_related_files)
+        related_files_layout.addWidget(self.btn_related_files)
+        
+        self.btn_select_paths = QPushButton("Select Files from Clipboard")
+        self.btn_select_paths.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogOpenButton))
+        self.btn_select_paths.clicked.connect(self.select_files_from_clipboard)
+        related_files_layout.addWidget(self.btn_select_paths)
+        
+        context_layout.addLayout(related_files_layout)
+        
         splitter.addWidget(context_widget)
         
         splitter.setStretchFactor(0, 2)
@@ -509,6 +530,141 @@ class ClaudeInterfaceApp(QMainWindow):
     def copy_system_prompt(self):
         QApplication.clipboard().setText(self.system_prompt)
         self.status_message("System prompt copied to clipboard!")
+
+    def copy_for_related_files(self):
+        """Copy context with the related files prompt appended."""
+        files = self.get_checked_files()
+        output = []
+        
+        output.append("Files:")
+        for abs_path, rel_path in files:
+            try:
+                with open(abs_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                output.append(f"File: {abs_path}\n```\n{content}\n```\n")
+            except Exception as e:
+                output.append(f"File: {abs_path} (Error reading file: {e})\n")
+        
+        user_context = self.text_context.toPlainText().strip()
+        if user_context:
+            output.append(f"\nContext/Instructions:\n{user_context}\n")
+        
+        output.append(f"\n{self.related_files_prompt}")
+        
+        full_text = "\n".join(output)
+        QApplication.clipboard().setText(full_text)
+        self.status_message("Context with related files prompt copied to clipboard!")
+
+    def select_files_from_clipboard(self):
+        """Parse paths from clipboard and select only those files in the file trees."""
+        clipboard_text = QApplication.clipboard().text()
+        if not clipboard_text:
+            self.status_message("Clipboard is empty.")
+            return
+        
+        # Try to find the "Paths:" pattern
+        paths_match = re.search(r'Paths:\s*(.+)', clipboard_text)
+        if not paths_match:
+            QMessageBox.warning(self, "No Paths Found", "Could not find 'Paths:' format in clipboard content.")
+            return
+        
+        paths_str = paths_match.group(1)
+        # Split by comma and clean up
+        clipboard_paths = set()
+        for p in paths_str.split(','):
+            p = p.strip().strip('`\'"')
+            if p:
+                # Normalize path separators
+                p = p.replace('\\', '/')
+                clipboard_paths.add(p)
+        
+        if not clipboard_paths:
+            QMessageBox.warning(self, "No Paths Found", "No valid paths found in clipboard content.")
+            return
+        
+        # Collect all known absolute paths from file trees
+        tree_paths = {}  # abs_path -> (tree, item) mapping
+        for tree in self.file_trees:
+            iterator = QTreeWidgetItemIterator(tree)
+            while iterator.value():
+                item = iterator.value()
+                path = item.data(0, Qt.ItemDataRole.UserRole)
+                if path and os.path.isfile(path):
+                    tree_paths[path] = (tree, item)
+                iterator += 1
+        
+        # Build mapping of path variations to absolute paths
+        path_map = {}  # various forms -> abs_path
+        for abs_path in tree_paths:
+            path_map[abs_path] = abs_path
+            # Also map relative paths from each root
+            for root_tree in self.file_trees:
+                if root_tree.topLevelItemCount() > 0:
+                    root_path = root_tree.topLevelItem(0).data(0, Qt.ItemDataRole.UserRole)
+                    try:
+                        rel = os.path.relpath(abs_path, root_path)
+                        path_map[rel] = abs_path
+                    except ValueError:
+                        pass
+                    # Also try with forward slashes
+                    rel_fwd = rel.replace('\\', '/')
+                    path_map[rel_fwd] = abs_path
+        
+        # Find matching files
+        matched_paths = set()
+        unmatched = []
+        for clip_path in clipboard_paths:
+            # Try exact match first
+            if clip_path in path_map:
+                matched_paths.add(path_map[clip_path])
+                continue
+            
+            # Try basename match
+            basename = os.path.basename(clip_path)
+            found = False
+            for abs_path in tree_paths:
+                if os.path.basename(abs_path) == basename:
+                    matched_paths.add(abs_path)
+                    found = True
+                    break
+            
+            if not found:
+                unmatched.append(clip_path)
+        
+        if not matched_paths:
+            QMessageBox.warning(self, "No Matches", "None of the paths from clipboard were found in the file trees.")
+            return
+        
+        # Uncheck all files first
+        for tree in self.file_trees:
+            tree.blockSignals(True)
+            iterator = QTreeWidgetItemIterator(tree)
+            while iterator.value():
+                item = iterator.value()
+                item.setCheckState(0, Qt.CheckState.Unchecked)
+                iterator += 1
+        
+        # Check only matched files
+        for abs_path in matched_paths:
+            if abs_path in tree_paths:
+                tree, item = tree_paths[abs_path]
+                item.setCheckState(0, Qt.CheckState.Checked)
+                # Expand parent directories to make selected files visible
+                parent = item.parent()
+                while parent:
+                    parent.setExpanded(True)
+                    parent = parent.parent()
+        
+        # Re-enable signals
+        for tree in self.file_trees:
+            tree.blockSignals(False)
+        
+        # Show results
+        msg = f"Selected {len(matched_paths)} file(s)."
+        if unmatched:
+            msg += f"\n\nUnmatched paths:\n" + "\n".join(unmatched)
+        QMessageBox.information(self, "Selection Result", msg)
+        self.mark_dirty()
 
     def paste_and_apply(self):
         response = QApplication.clipboard().text()
