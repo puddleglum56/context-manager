@@ -61,7 +61,10 @@ class ClaudeInterfaceApp(QMainWindow):
         )
         
         self.related_files_prompt = (
-            "Please, just give me a list of the files (full paths) that might be related to this issue. Format your answer like so:\n"
+            "You will flag relevant files as context for a downstream coding assistant tasked with addressing the above question/issue. "
+            "Please output only a list of the files (full paths) that might be related to the above question/issue. "
+            "Bias towards including more files rather than fewer - it's easier for the downstream assistant to ignore irrelevant files than to ask follow up questions about missing files. "
+            "Format your answer like so:\n"
             "Paths: /path/to/file.ts, /path/to/other_file.ts, /other_path/to/file2.ts"
         )
 
